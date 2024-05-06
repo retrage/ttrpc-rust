@@ -28,7 +28,7 @@ use tokio::{
     task,
     time::timeout,
 };
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 use tokio_vsock::VsockListener;
 
 use crate::asynchronous::unix_incoming::UnixIncoming;
@@ -112,7 +112,7 @@ impl Server {
         self
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     pub fn set_domain_vsock(mut self) -> Self {
         self.domain = Some(Domain::Vsock);
         self
@@ -161,7 +161,7 @@ impl Server {
             // It seems that we can use UnixStream to represent both UnixStream and VsockStream.
             // Whatever, we keep it for now for the compatibility and vsock-specific features maybe
             // used in the future.
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
             Some(Domain::Vsock) => {
                 let incoming = unsafe { VsockListener::from_raw_fd(listenfd).incoming() };
                 self.do_start(incoming).await

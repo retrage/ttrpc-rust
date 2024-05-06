@@ -21,7 +21,7 @@ use std::os::unix::prelude::AsRawFd;
 use nix::Error;
 
 use nix::unistd::*;
-use std::sync::{Arc};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::common::{self, client_connect, SOCK_CLOEXEC};
 #[cfg(target_os = "macos")] 
@@ -72,9 +72,9 @@ impl PipeListener {
         #[cfg(target_os = "macos")] 
         let fds = {
             let (rfd, wfd) = pipe()?;
-            set_fd_close_exec(rfd)?;
-            set_fd_close_exec(wfd)?;
-            (rfd, wfd)
+            set_fd_close_exec(rfd.as_raw_fd())?;
+            set_fd_close_exec(wfd.as_raw_fd())?;
+            (rfd.as_raw_fd(), wfd.as_raw_fd())
         };
 
         Ok(fds)
@@ -251,14 +251,14 @@ impl ClientConnection {
         // so there is a chance of leak if fork + exec happens in between of these calls.
         #[cfg(target_os = "macos")]
         {
-            set_fd_close_exec(recver_fd).unwrap();
-            set_fd_close_exec(close_fd).unwrap();
+            set_fd_close_exec(recver_fd.as_raw_fd()).unwrap();
+            set_fd_close_exec(close_fd.as_raw_fd()).unwrap();
         }
 
 
         ClientConnection { 
             fd, 
-            socket_pair: (recver_fd, close_fd) 
+            socket_pair: (recver_fd.as_raw_fd(), close_fd.as_raw_fd())
         }
     }
 

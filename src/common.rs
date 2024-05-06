@@ -13,6 +13,7 @@
 use nix::fcntl::FdFlag;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::*;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 
 use crate::error::{Error, Result};
@@ -20,7 +21,7 @@ use crate::error::{Error, Result};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Domain {
     Unix,
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     Vsock,
 }
 
@@ -31,7 +32,8 @@ pub(crate) fn do_listen(listener: RawFd) -> Result<()> {
         )));
     }
 
-    listen(listener, 10).map_err(|e| Error::Socket(e.to_string()))
+    let listener = unsafe { OwnedFd::from_raw_fd(listener) };
+    listen(&listener, Backlog::new(50).unwrap()).map_err(|e| Error::Socket(e.to_string()))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -56,6 +58,11 @@ fn parse_sockaddr(addr: &str) -> Result<(Domain, &str)> {
             ));
         }
         return Ok((Domain::Unix, addr));
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(addr) = addr.strip_prefix("vsock://") {
+        return Ok((Domain::Vsock, addr));
     }
 
     Err(Error::Others(format!("Scheme {addr:?} is not supported")))
@@ -97,29 +104,34 @@ fn make_addr(domain: Domain, sockaddr: &str) -> Result<UnixAddr> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn make_addr(_domain: Domain, sockaddr: &str) -> Result<UnixAddr> {
-    UnixAddr::new(sockaddr).map_err(err_to_others_err!(e, ""))
+fn make_addr(domain: Domain, sockaddr: &str) -> Result<UnixAddr> {
+    match domain {
+        Domain::Unix => UnixAddr::new(sockaddr).map_err(err_to_others_err!(e, "")),
+        Domain::Vsock => Err(Error::Others(
+            "function make_addr does not support create vsock socket".to_string(),
+        )),
+    }
 }
 
-fn make_socket(addr: (&str, u32)) -> Result<(RawFd, Domain, Box<dyn SockaddrLike>)> {
+fn make_socket(addr: (&str, u32)) -> Result<(OwnedFd, Domain, Box<dyn SockaddrLike>)> {
     let (sockaddr, _) = addr;
     let (domain, sockaddrv) = parse_sockaddr(sockaddr)?;
 
-    let get_sock_addr = |domain, sockaddr| -> Result<(RawFd, Box<dyn SockaddrLike>)> {
+    let get_sock_addr = |domain, sockaddr| -> Result<(OwnedFd, Box<dyn SockaddrLike>)> {
         let fd = socket(AddressFamily::Unix, SockType::Stream, SOCK_CLOEXEC, None)
             .map_err(|e| Error::Socket(e.to_string()))?;
 
         // MacOS doesn't support atomic creation of a socket descriptor with SOCK_CLOEXEC flag,
         // so there is a chance of leak if fork + exec happens in between of these calls.
         #[cfg(target_os = "macos")]
-        set_fd_close_exec(fd)?;
+        set_fd_close_exec(fd.as_raw_fd())?;
         let sockaddr = make_addr(domain, sockaddr)?;
         Ok((fd, Box::new(sockaddr)))
     };
 
-    let (fd, sockaddr): (i32, Box<dyn SockaddrLike>) = match domain {
+    let (fd, sockaddr): (OwnedFd, Box<dyn SockaddrLike>) = match domain {
         Domain::Unix => get_sock_addr(domain, sockaddrv)?,
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
         Domain::Vsock => {
             let sockaddr_port_v: Vec<&str> = sockaddrv.split(':').collect();
             if sockaddr_port_v.len() != 2 {
@@ -133,10 +145,15 @@ fn make_socket(addr: (&str, u32)) -> Result<(RawFd, Domain, Box<dyn SockaddrLike
             let fd = socket(
                 AddressFamily::Vsock,
                 SockType::Stream,
+                #[cfg(not(target_os = "macos"))]
                 SockFlag::SOCK_CLOEXEC,
+                #[cfg(target_os = "macos")]
+                SockFlag::empty(),
                 None,
             )
             .map_err(|e| Error::Socket(e.to_string()))?;
+            #[cfg(target_os = "macos")]
+            set_fd_close_exec(fd.as_raw_fd())?;
             let cid = addr.1;
             let sockaddr = VsockAddr::new(cid, port);
             (fd, Box::new(sockaddr))
@@ -159,19 +176,19 @@ const VMADDR_CID_HOST: u32 = 0;
 pub(crate) fn do_bind(sockaddr: &str) -> Result<(RawFd, Domain)> {
     let (fd, domain, sockaddr) = make_socket((sockaddr, VMADDR_CID_ANY))?;
 
-    setsockopt(fd, sockopt::ReusePort, &true)?;
-    bind(fd, sockaddr.as_ref()).map_err(err_to_others_err!(e, ""))?;
+    setsockopt(&fd, sockopt::ReusePort, &true)?;
+    bind(fd.as_raw_fd(), sockaddr.as_ref()).map_err(err_to_others_err!(e, ""))?;
 
-    Ok((fd, domain))
+    Ok((fd.as_raw_fd(), domain))
 }
 
 /// Creates a unix socket for client.
 pub(crate) unsafe fn client_connect(sockaddr: &str) -> Result<RawFd> {
     let (fd, _, sockaddr) = make_socket((sockaddr, VMADDR_CID_HOST))?;
 
-    connect(fd, sockaddr.as_ref())?;
+    connect(fd.as_raw_fd(), sockaddr.as_ref())?;
 
-    Ok(fd)
+    Ok(fd.as_raw_fd())
 }
 
 #[cfg(test)]
@@ -210,7 +227,34 @@ mod tests {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_parse_sockaddr() {
+        for i in &[
+            (
+                "unix:///run/a.sock",
+                Some(Domain::Unix),
+                "/run/a.sock",
+                true,
+            ),
+            ("vsock://8:1024", Some(Domain::Vsock), "8:1024", true),
+            ("Vsock://8:1025", Some(Domain::Vsock), "8:1025", false),
+            ("unix://@/run/b.sock", None, "", false),
+            ("abc:///run/c.sock", None, "", false),
+        ] {
+            let (input, domain, addr, success) = (i.0, i.1, i.2, i.3);
+            let r = parse_sockaddr(input);
+            if success {
+                let (rd, ra) = r.unwrap();
+                assert_eq!(rd, domain.unwrap());
+                assert_eq!(ra, addr);
+            } else {
+                assert!(r.is_err());
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     #[test]
     fn test_parse_sockaddr() {
         for i in &[
